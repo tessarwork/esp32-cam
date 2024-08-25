@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_vfs_fat.h"
@@ -8,6 +9,7 @@
 
 #include <esp_system.h>
 #include <sys/param.h>
+#include <dirent.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,12 +41,8 @@ static const char *TAG = "camera_capture";
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
-
-
-
 void app_main(void) {
-
-     // Initialize the camera
+    // Initialize the camera
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -66,9 +64,9 @@ void app_main(void) {
     config.pin_reset = CAM_PIN_RESET;
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = FRAMESIZE_96X96;
+    config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
-    config.fb_count = 1;
+    config.fb_count = 3;
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
@@ -77,15 +75,12 @@ void app_main(void) {
     }
 
     sensor_t *s = esp_camera_sensor_get();
-    s->set_gain_ctrl(s, 0);                       // auto gain off
-    s->set_awb_gain(s, 1);                        // Auto White Balance enable (0 or 1)
-    s->set_exposure_ctrl(s, 0);                   // auto exposure off
-    s->set_brightness(s, 2);                     // (-2 to 2) - set brightness
-    s->set_agc_gain(s, 10);          // set gain manually (0 - 30)
-    s->set_aec_value(s, 500);     // set exposure manually  (0-1200)
-
-
-
+    s->set_gain_ctrl(s, 0);        // auto gain off
+    s->set_awb_gain(s, 1);         // Auto White Balance enable (0 or 1)
+    s->set_exposure_ctrl(s, 0);    // auto exposure off
+    s->set_brightness(s, 2);       // (-2 to 2) - set brightness
+    s->set_agc_gain(s, 10);        // set gain manually (0 - 30)
+    s->set_aec_value(s, 500);      // set exposure manually (0-1200)
 
     // Initialize NVS
     esp_err_t err_nvs = nvs_flash_init();
@@ -102,35 +97,6 @@ void app_main(void) {
         return;
     }
 
-    // Read the counter value, initialize if not found
-    int file_index = 0;
-    err_nvs = nvs_get_i32(my_handle, "file_index", &file_index);
-    if (err_nvs == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI("NVS", "The value is not initialized yet!");
-    } else if (err_nvs != ESP_OK) {
-        ESP_LOGE("NVS", "Error (%s) reading!", esp_err_to_name(err_nvs));
-        nvs_close(my_handle);
-        return;
-    }
-
-    // Increment and save the counter
-    file_index++;
-    err_nvs = nvs_set_i32(my_handle, "file_index", file_index);
-    if (err_nvs != ESP_OK) {
-        ESP_LOGE("NVS", "Error (%s) writing!", esp_err_to_name(err_nvs));
-        nvs_close(my_handle);
-        return;
-    }
-
-    // Commit the value to NVS
-    err_nvs = nvs_commit(my_handle);
-    nvs_close(my_handle);
-    if (err_nvs != ESP_OK) {
-        ESP_LOGE("NVS", "Error (%s) committing!", esp_err_to_name(err_nvs));
-        return;
-    }
-    
-
     // Mount SD card
     const char mount_point[] = "/sdcard";
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
@@ -145,13 +111,65 @@ void app_main(void) {
     err_nvs = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
     if (err_nvs != ESP_OK) {
         ESP_LOGE("SD Card", "Failed to mount filesystem (%s).", esp_err_to_name(err_nvs));
+        nvs_close(my_handle);
         return;
     }
 
+    // Check if SD card is empty
+    DIR* dir = opendir(mount_point);
+    bool is_empty = true;
+    if (dir != NULL) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_REG) { // Check if it's a regular file
+                is_empty = false;
+                break;
+            }
+        }
+        closedir(dir);
+    }
 
+    // Read the counter value, initialize if not found
+    int file_index = 0;
+    err_nvs = nvs_get_i32(my_handle, "file_index", &file_index);
+    if (err_nvs == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI("NVS", "The value is not initialized yet!");
+    } else if (err_nvs != ESP_OK) {
+        ESP_LOGE("NVS", "Error (%s) reading!", esp_err_to_name(err_nvs));
+        nvs_close(my_handle);
+        esp_vfs_fat_sdcard_unmount(mount_point, card);
+        return;
+    }
 
+    // Reset file index if SD card is empty
+    if (is_empty) {
+        file_index = 0;
+        ESP_LOGI("NVS", "SD card is empty. Resetting file index to 0.");
+    } else {
+        file_index++;
+    }
+
+    // Save the updated file index to NVS
+    err_nvs = nvs_set_i32(my_handle, "file_index", file_index);
+    if (err_nvs != ESP_OK) {
+        ESP_LOGE("NVS", "Error (%s) writing!", esp_err_to_name(err_nvs));
+        nvs_close(my_handle);
+        esp_vfs_fat_sdcard_unmount(mount_point, card);
+        return;
+    }
+
+    // Commit the value to NVS
+    err_nvs = nvs_commit(my_handle);
+    nvs_close(my_handle);
+    if (err_nvs != ESP_OK) {
+        ESP_LOGE("NVS", "Error (%s) committing!", esp_err_to_name(err_nvs));
+        esp_vfs_fat_sdcard_unmount(mount_point, card);
+        return;
+    }
+
+    // Capture image from camera
     camera_fb_t *fb = esp_camera_fb_get();
-    if(!fb){ 
+    if (!fb) {
         ESP_LOGE(TAG, "camera capture failed");
         esp_vfs_fat_sdcard_unmount(mount_point, card);
         return;
@@ -159,32 +177,40 @@ void app_main(void) {
 
     // Create unique file name
     char filepath[64];
+    char filepath_gambar[64];
     sprintf(filepath, "%s/file_%d.txt", mount_point, file_index);
+    sprintf(filepath_gambar, "%s/file_%d.jpg", mount_point, file_index);
 
     // Open file for writing
     FILE* f = fopen(filepath, "w");
-    for (size_t i = 0; i < fb->len; i++){ 
-        fprintf(f, "%02x ", fb->buf[i]);
-        if((i+1 ) % 16 == 0){ 
+    if(f){
+        for (size_t i = 0; i < fb->len; i++) {
+        fprintf(f, "%d ", fb->buf[i]);
+        if ((i + 1) % 16 == 0) {
             fprintf(f, "\n");
+            }
         }
+        fclose(f);
+        ESP_LOGI("FILE","Image array saved to %s ", filepath);        
+    }else{ 
+        ESP_LOGE("FILE","Failed to open %s for writing ", filepath);
     }
-    fclose(f);
-    // if (f != NULL) {
-    //     fwrite(fb->buf,1 , fb->len, f);
-    //     fclose(f);
-    //     ESP_LOGI(TAG, "File saved to %s ", filepath);
-        
-    // }else{ 
-    //     ESP_LOGE(TAG, "Failed to open file for writing");
-    // }
+
+    
+
+    FILE *f_gambar = fopen(filepath_gambar, "w");
+    if (f_gambar)
+    {
+        fwrite(fb-> buf, 1, fb->len, f_gambar);
+        fclose(f_gambar);
+        ESP_LOGI("FILE","IMAGE SAVED to %s ", filepath_gambar);
+    }else{ 
+        ESP_LOGE("FILE", "failed to write ", filepath_gambar);
+    }
+    
 
     esp_camera_fb_return(fb);
-
-    // Write to file
-    // fprintf(f, "This is the log number %d.\n", file_index);
-    // fclose(f);
-    ESP_LOGI("File", "File %s has been created and written successfully", filepath);
+    // ESP_LOGI("File", "File %s has been created and written successfully", filepath);
 
     // Unmount the SD card
     esp_vfs_fat_sdcard_unmount(mount_point, card);
