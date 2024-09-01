@@ -1,3 +1,5 @@
 build/
 sdkconfig
 sdkconfig.old
+components_1/
+espressif__opencv/
